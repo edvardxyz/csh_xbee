@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "csp/autoconfig.h"
+#include "csp/csp_buffer.h"
 
 typedef enum {
 	XBEE_MODE_NOT_STARTED,
@@ -58,9 +59,10 @@ void escape_byte(uint8_t byte, uint8_t * output, uint16_t * index) {
 
 int csp_xbee_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet, int from_me) {
 
-	packet->id.flags |= 0xFE;
+	//packet->id.flags |= 0xFE;
 	csp_id_prepend(packet);
-	send_16bit_frame(packet->id.dst, iface->driver_data, packet->data, packet->length);
+	send_16bit_frame(packet->id.dst, iface->driver_data, packet->frame_begin, packet->frame_length);
+	csp_buffer_free(packet);
 
 	return 0;
 }
@@ -105,28 +107,16 @@ void send_16bit_frame(uint16_t dest_address, void * driver_data, const uint8_t *
 	if (n < 0) {
 		printf("failed write\n");
 	}
-	for (uint16_t i = 0; i < length; i++) {
-		printf("%02X ", frame[i]);
-	}
-	printf("\n\n");
-}
-
-int xbee_driver_tx(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc) {
-	return CSP_ERR_NONE;
 }
 
 void xbee_driver_rx(void * user_data, uint8_t * data, size_t data_size, void * pxTaskWoken) {
 	xbee_ctx_t * ctx = (xbee_ctx_t *)user_data;
 
-	for (uint16_t i = 0; i < data_size; i++) {
-		printf("%02X ", data[i]);
-	}
-	printf("\n");
 
 	for (int i = 0; i < data_size; i++) {
 		if (data[i] == 0x7D) {
 			ctx->escape_next = true;  // Next byte is escaped
-			return;                   // Wait for next byte
+			continue;                   // Wait for next byte
 		}
 
 		if (ctx->escape_next) {
@@ -138,6 +128,7 @@ void xbee_driver_rx(void * user_data, uint8_t * data, size_t data_size, void * p
 			case XBEE_MODE_NOT_STARTED:
 				if (data[i] == 0x7E) {
 					// Start delimiter detected
+					ctx->rx_packet = csp_buffer_get(0);
 					csp_id_setup_rx(ctx->rx_packet);
 					ctx->xbee_mode = XBEE_MODE_LENGTH_MSB;
 					ctx->length = 0;
@@ -165,7 +156,7 @@ void xbee_driver_rx(void * user_data, uint8_t * data, size_t data_size, void * p
 				ctx->checksum += data[i];
 				ctx->data_index++;
 
-				if (ctx->data_index >= 4) {
+				if (ctx->data_index >= 5) {
 					ctx->xbee_mode = XBEE_MODE_RECEIVING;
 				}
 				break;
@@ -175,6 +166,7 @@ void xbee_driver_rx(void * user_data, uint8_t * data, size_t data_size, void * p
 				if (ctx->data_index < ctx->length) {
 					ctx->checksum += data[i];
 					ctx->rx_packet->frame_begin[ctx->rx_packet->frame_length++] = data[i];  // xd
+					ctx->data_index++;
 				} else {
 					// Last byte is the checksum
 					uint8_t calculated_checksum = 0xFF - ctx->checksum;
@@ -183,12 +175,6 @@ void xbee_driver_rx(void * user_data, uint8_t * data, size_t data_size, void * p
 						uint16_t frame_len = ctx->rx_packet->frame_length;
 						ctx->iface.rxbytes += frame_len;
 						ctx->iface.rx++;
-
-						printf("RF Data (HEX): ");
-						for (uint16_t i = 0; i < frame_len; i++) {
-							printf("%02X ", ctx->rx_packet->frame_begin[i]);
-						}
-						printf("\n");
 
 						if (csp_id_strip(ctx->rx_packet) < 0) {
 							ctx->iface.frame++;
@@ -200,7 +186,6 @@ void xbee_driver_rx(void * user_data, uint8_t * data, size_t data_size, void * p
 					} else {
 						ctx->iface.rx_error++;
 						ctx->iface.drop++;
-						printf("invalid calc %u != got %u\n ", calculated_checksum, data[i]);
 						// Checksum invalid, handle error
 					}
 					// Reset state for next frame
